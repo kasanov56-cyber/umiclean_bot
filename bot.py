@@ -1,17 +1,26 @@
 import os
 import logging
 import asyncio 
-import re # Для проверки ввода площади
+import re 
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, StateFilter, Command
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Импортируем функции для работы с базой данных
-from database import init_db, get_price, SERVICE_NAMES
+# ИМПОРТ ИСПРАВЛЕН: Теперь импортируем только то, что есть в database.py
+from database import (
+    init_db, 
+    get_price, 
+    get_all_prices, 
+    update_price, 
+    get_base_services, 
+    get_addon_services, 
+    get_service_description 
+)
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 # --- КОНФИГУРАЦИЯ ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
-ADMIN_ID = 952117349  # <--- ВАЖНО: ЗАМЕНИТЕ 0 НА ВАШ ТЕЛЕГРАМ ID!
+ADMIN_ID = 0  # <--- ВАЖНО: ЗАМЕНИТЕ 0 НА ВАШ ТЕЛЕГРАМ ID!
 
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN environment variable not set.")
@@ -33,6 +42,13 @@ class CleaningStates(StatesGroup):
     choosing_extras = State()
     waiting_for_area = State()
 
+# --- СОСТОЯНИЯ FSM ДЛЯ АДМИНА ---
+
+class AdminStates(StatesGroup):
+    """Состояния для изменения цен админом."""
+    waiting_for_new_price = State()
+    price_key_to_update = State() 
+
 # --- ОСНОВНАЯ ЛОГИКА ---
 
 bot = Bot(token=BOT_TOKEN)
@@ -42,34 +58,35 @@ dp = Dispatcher()
 selected_extras_storage = {}
 
 
-def get_cleaning_type_kb() -> InlineKeyboardMarkup:
-    """Создает клавиатуру для выбора типа уборки."""
+# --- ФУНКЦИИ КЛАВИАТУР ---
+
+async def get_cleaning_type_kb() -> InlineKeyboardMarkup:
+    """Создает клавиатуру для выбора типа уборки, используя данные из БД."""
     builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text=SERVICE_NAMES['general_cleaning_m2'], callback_data="type_general_cleaning"),
-        InlineKeyboardButton(text=SERVICE_NAMES['after_repair_m2'], callback_data="type_after_repair")
-    )
-    return builder.as_markup()
+    
+    base_services = await get_base_services() 
+    
+    for key, description in base_services:
+        builder.button(
+            text=description, 
+            callback_data=f"type_{key}"
+        )
+        
+    return builder.adjust(2).as_markup()
 
 async def get_extras_kb(current_choices: list = None) -> InlineKeyboardMarkup:
     """Создает клавиатуру для выбора дополнительных услуг."""
     builder = InlineKeyboardBuilder()
     
-    # Ключи для дополнительных (фиксированных) услуг
-    extra_keys = ['windows_price', 'fridge_price', 'oven_price']
+    addon_services = await get_addon_services() 
     
-    for key in extra_keys:
-        name = SERVICE_NAMES.get(key, key)
-        price = await get_price(key)
+    for key, description, price in addon_services:
         
-        # Проверяем, выбрана ли уже эта услуга
         is_selected = key in (current_choices or [])
-        
-        # Добавляем галочку, если услуга выбрана
         status = "✅ " if is_selected else ""
         
         builder.button(
-            text=f"{status}{name} ({price} сом)",
+            text=f"{status}{description} ({price:.0f} сом)",
             callback_data=f"extra_{key}"
         )
 
@@ -77,16 +94,13 @@ async def get_extras_kb(current_choices: list = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Продолжить и рассчитать ➡️", callback_data="calculate_start")
     )
     
-    # Делаем кнопки в два столбца
     return builder.adjust(1).as_markup()
 
-
-# --- ХЭНДЛЕРЫ ---
+# --- ХЭНДЛЕРЫ КАЛЬКУЛЯТОРА ---
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message, state: FSMContext) -> None:
     """Обработчик команды /start: начинает опрос, предлагает выбор типа уборки."""
-    # Очищаем данные FSM и хранилище доп. услуг
     await state.clear()
     if message.from_user.id in selected_extras_storage:
         del selected_extras_storage[message.from_user.id]
@@ -95,9 +109,8 @@ async def command_start_handler(message: Message, state: FSMContext) -> None:
         f"Привет, {message.from_user.full_name}! 👋\n\n"
         f"Я — калькулятор клининговой компании **Umi Clean KG**.\n"
         f"Выберите тип уборки для начала расчета:",
-        reply_markup=get_cleaning_type_kb()
+        reply_markup=await get_cleaning_type_kb()
     )
-    # Переводим пользователя в состояние выбора типа
     await state.set_state(CleaningStates.choosing_type)
 
 
@@ -106,18 +119,17 @@ async def process_cleaning_type(callback: CallbackQuery, state: FSMContext) -> N
     """Обработка выбора типа уборки."""
     base_type_key = callback.data.replace("type_", "")
     
-    # Сохраняем базовый тип уборки в FSM-контексте
     await state.update_data(base_type=base_type_key)
     
-    # Инициализируем хранилище выбранных доп. услуг
     selected_extras_storage[callback.from_user.id] = []
     
+    service_name = await get_service_description(base_type_key)
+    
     await callback.message.edit_text(
-        f"Вы выбрали **{SERVICE_NAMES.get(f'{base_type_key}_m2')}**.\n"
+        f"Вы выбрали **{service_name}**.\n"
         f"Теперь выберите дополнительные услуги (можно выбрать несколько):",
         reply_markup=await get_extras_kb()
     )
-    # Переводим пользователя в состояние выбора дополнительных услуг
     await state.set_state(CleaningStates.choosing_extras)
     await callback.answer()
 
@@ -128,20 +140,18 @@ async def process_extras_choice(callback: CallbackQuery) -> None:
     extra_key = callback.data.replace("extra_", "")
     user_id = callback.from_user.id
     
-    # Получаем текущий список выбранных услуг
     current_choices = selected_extras_storage.get(user_id, [])
-    
-    # Логика переключения (toggle)
+    service_name = await get_service_description(extra_key)
+
     if extra_key in current_choices:
         current_choices.remove(extra_key)
-        message = f"❌ Услуга **{SERVICE_NAMES.get(extra_key)}** удалена."
+        message = f"❌ Услуга **{service_name}** удалена."
     else:
         current_choices.append(extra_key)
-        message = f"✅ Услуга **{SERVICE_NAMES.get(extra_key)}** добавлена."
+        message = f"✅ Услуга **{service_name}** добавлена."
         
     selected_extras_storage[user_id] = current_choices
     
-    # Обновляем клавиатуру, чтобы показать/скрыть галочку
     await callback.message.edit_reply_markup(
         reply_markup=await get_extras_kb(current_choices)
     )
@@ -155,7 +165,6 @@ async def start_area_input(callback: CallbackQuery, state: FSMContext) -> None:
         "📝 **Введите площадь** вашего помещения в квадратных метрах (только число). "
         "Например: `45` или `120`."
     )
-    # Переводим пользователя в состояние ожидания ввода площади
     await state.set_state(CleaningStates.waiting_for_area)
     await callback.answer()
 
@@ -173,20 +182,20 @@ async def process_area_and_calculate(message: Message, state: FSMContext) -> Non
         
     area = float(area_str)
     
-    # 1. Получаем данные из FSM и хранилища
+    # 1. Получаем данные
     data = await state.get_data()
     base_type_key = data.get('base_type')
     selected_extras = selected_extras_storage.get(user_id, [])
     
-    # 2. Получаем цены из базы
-    base_price_m2 = await get_price(f'{base_type_key}_m2')
+    # 2. Получаем цены
+    base_price_m2 = await get_price(base_type_key)
+    base_service_name = await get_service_description(base_type_key)
     
     # 3. Расчет базовой стоимости
     total_cost = base_price_m2 * area
     
-    # Формируем итоговое сообщение и список выбранных услуг
     summary_text = f"**Ваш предварительный расчет:**\n\n"
-    summary_text += f"**1. Тип уборки:** {SERVICE_NAMES.get(f'{base_type_key}_m2')}\n"
+    summary_text += f"**1. Тип уборки:** {base_service_name}\n"
     summary_text += f"   - Площадь: {area:.1f} м²\n"
     summary_text += f"   - Цена за м²: {base_price_m2:.1f} сом\n"
     summary_text += f"   - Базовая стоимость: **{total_cost:.1f} сом**\n\n"
@@ -198,8 +207,16 @@ async def process_area_and_calculate(message: Message, state: FSMContext) -> Non
         
         for extra_key in selected_extras:
             price = await get_price(extra_key)
-            extras_cost += price
-            summary_text += f"   - {SERVICE_NAMES.get(extra_key)}: {price:.1f} сом\n"
+            service_name = await get_service_description(extra_key)
+            
+            # Если это окна, умножаем на площадь. Иначе — фиксированная цена.
+            if 'windows' in extra_key:
+                cost = price * area
+                extras_cost += cost
+                summary_text += f"   - {service_name} ({area:.1f} м²): {cost:.1f} сом\n"
+            else:
+                extras_cost += price
+                summary_text += f"   - {service_name}: {price:.1f} сом\n"
             
         total_cost += extras_cost
         summary_text += f"\n   - Стоимость доп. услуг: **{extras_cost:.1f} сом**\n"
@@ -214,55 +231,23 @@ async def process_area_and_calculate(message: Message, state: FSMContext) -> Non
     
     await message.answer(summary_text)
 
-    # Очищаем состояние и хранилище доп. услуг после расчета
+    # Очистка состояния
     await state.clear()
     if user_id in selected_extras_storage:
         del selected_extras_storage[user_id]
         
-    # Предлагаем начать заново
     await message.answer("✅ Расчет завершен. Нажмите /start для нового расчета.")
 
 
-# --- ФУНКЦИЯ ЗАПУСКА ---
+# --- ХЭНДЛЕРЫ АДМИН-ПАНЕЛИ ---
 
-async def main() -> None:
-    """Главная функция для запуска бота."""
-    # Инициализируем базу данных перед запуском бота
-    await init_db()
-    
-    # Запускаем бота
-    logging.info("Starting bot...")
-    await dp.start_polling(bot)
-
-# --- БЛОК ЗАПУСКА СКРИПТА ---
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by KeyboardInterrupt")
-    except Exception as e:
-        logging.error(f"Error starting bot: {e}")
-        # --- СОСТОЯНИЯ FSM ДЛЯ АДМИНА ---
-
-class AdminStates(StatesGroup):
-    """Состояния для изменения цен админом."""
-    waiting_for_new_price = State()
-    price_key_to_update = State() # Временное хранение ключа, который меняем
-    # Импортируем функцию update_price
-from database import init_db, get_price, SERVICE_NAMES, get_all_prices, update_price
-
-# ... (весь остальной код) ...
-
-# --- ЛОГИКА АДМИН-ПАНЕЛИ ---
-
-def get_admin_kb(prices_list) -> InlineKeyboardMarkup:
+async def get_admin_kb(prices_list) -> InlineKeyboardMarkup:
     """Создает клавиатуру со списком цен для редактирования."""
     builder = InlineKeyboardBuilder()
     
     for key, value, desc in prices_list:
         builder.button(
-            text=f"{desc}: {value} сом",
+            text=f"{desc}: {value:.1f} сом",
             callback_data=f"editprice_{key}"
         )
     
@@ -280,7 +265,6 @@ async def admin_start_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Доступ запрещен.")
         return
 
-    # Сбрасываем текущее состояние клиента (если было)
     await state.clear()
     
     prices = await get_all_prices()
@@ -288,7 +272,7 @@ async def admin_start_handler(message: Message, state: FSMContext) -> None:
     await message.answer(
         "🛠 **АДМИН-ПАНЕЛЬ: Редактирование цен** 🛠\n"
         "Нажмите на услугу, чтобы изменить ее цену:",
-        reply_markup=get_admin_kb(prices)
+        reply_markup=await get_admin_kb(prices)
     )
 
 
@@ -301,17 +285,15 @@ async def admin_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
 
     price_key = callback.data.replace("editprice_", "")
     current_price = await get_price(price_key)
-    service_name = SERVICE_NAMES.get(price_key, price_key)
+    service_name = await get_service_description(price_key) # Получаем имя из БД
     
-    # Сохраняем ключ для последующего обновления
     await state.update_data(price_key_to_update=price_key)
     
     await callback.message.edit_text(
         f"Вы выбрали **{service_name}**.\n"
-        f"Текущая цена: **{current_price}** сом.\n\n"
-        "📝 **Введите новую числовую цену** (например, `180`):"
+        f"Текущая цена: **{current_price:.1f}** сом.\n\n"
+        "📝 **Введите новую числовую цену** (например, `180.5`):"
     )
-    # Переводим в состояние ожидания новой цены
     await state.set_state(AdminStates.waiting_for_new_price)
     await callback.answer()
 
@@ -319,37 +301,32 @@ async def admin_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.message(AdminStates.waiting_for_new_price)
 async def admin_process_new_price(message: Message, state: FSMContext) -> None:
     """Обработка ввода новой цены и обновление в базе."""
-    user_id = message.from_user.id
     new_price_str = message.text.replace(',', '.').strip()
     
-    # Проверка, что введенное значение — это положительное число
     if not re.match(r'^\d+(\.\d+)?$', new_price_str) or float(new_price_str) < 0:
         await message.answer("❌ Введите корректное числовое значение цены (не отрицательное).")
         return
 
     new_price = float(new_price_str)
     
-    # Получаем ключ услуги из контекста
     data = await state.get_data()
     price_key = data.get('price_key_to_update')
-    service_name = SERVICE_NAMES.get(price_key, price_key)
+    service_name = await get_service_description(price_key)
 
-    # Обновление в базе данных
     success = await update_price(price_key, new_price)
 
     if success:
-        await message.answer(f"✅ Цена для **{service_name}** обновлена на **{new_price}** сом.")
+        await message.answer(f"✅ Цена для **{service_name}** обновлена на **{new_price:.1f}** сом.")
     else:
         await message.answer("❌ Произошла ошибка при обновлении цены.")
 
-    # Сбрасываем состояние и возвращаемся к панели
     await state.clear()
     prices = await get_all_prices()
     
     await message.answer(
         "🛠 **АДМИН-ПАНЕЛЬ: Редактирование цен** 🛠\n"
         "Выберите следующую услугу для изменения или закройте:",
-        reply_markup=get_admin_kb(prices)
+        reply_markup=await get_admin_kb(prices)
     )
 
 @dp.callback_query(F.data == "admin_close")
@@ -362,3 +339,24 @@ async def admin_close(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text("Панель администрирования закрыта. Бот работает в режиме калькулятора.")
     await callback.answer()
+
+
+# --- ФУНКЦИЯ ЗАПУСКА ---
+
+async def main() -> None:
+    """Главная функция для запуска бота."""
+    # Инициализируем базу данных перед запуском бота
+    await init_db()
+    
+    logging.info("Starting bot...")
+    await dp.start_polling(bot)
+
+# --- БЛОК ЗАПУСКА СКРИПТА ---
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by KeyboardInterrupt")
+    except Exception as e:
+        logging.error(f"Error starting bot: {e}")
