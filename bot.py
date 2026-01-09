@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 # --- КОНФИГУРАЦИЯ ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
-ADMIN_ID = 0  # <--- ВАЖНО: ЗАМЕНИТЕ 0 НА ВАШ ТЕЛЕГРАМ ID!
+ADMIN_ID = 952117349  # <--- ВАЖНО: ЗАМЕНИТЕ 0 НА ВАШ ТЕЛЕГРАМ ID!
 
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN environment variable not set.")
