@@ -243,3 +243,122 @@ if __name__ == "__main__":
         logging.info("Bot stopped by KeyboardInterrupt")
     except Exception as e:
         logging.error(f"Error starting bot: {e}")
+        # --- СОСТОЯНИЯ FSM ДЛЯ АДМИНА ---
+
+class AdminStates(StatesGroup):
+    """Состояния для изменения цен админом."""
+    waiting_for_new_price = State()
+    price_key_to_update = State() # Временное хранение ключа, который меняем
+    # Импортируем функцию update_price
+from database import init_db, get_price, SERVICE_NAMES, get_all_prices, update_price
+
+# ... (весь остальной код) ...
+
+# --- ЛОГИКА АДМИН-ПАНЕЛИ ---
+
+def get_admin_kb(prices_list) -> InlineKeyboardMarkup:
+    """Создает клавиатуру со списком цен для редактирования."""
+    builder = InlineKeyboardBuilder()
+    
+    for key, value, desc in prices_list:
+        builder.button(
+            text=f"{desc}: {value} сом",
+            callback_data=f"editprice_{key}"
+        )
+    
+    builder.row(
+        InlineKeyboardButton(text="❌ Закрыть панель", callback_data="admin_close")
+    )
+    
+    return builder.adjust(1).as_markup()
+
+
+@dp.message(Command("admin"))
+async def admin_start_handler(message: Message, state: FSMContext) -> None:
+    """Обработчик команды /admin: открывает панель админа (только для ADMIN_ID)."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Доступ запрещен.")
+        return
+
+    # Сбрасываем текущее состояние клиента (если было)
+    await state.clear()
+    
+    prices = await get_all_prices()
+    
+    await message.answer(
+        "🛠 **АДМИН-ПАНЕЛЬ: Редактирование цен** 🛠\n"
+        "Нажмите на услугу, чтобы изменить ее цену:",
+        reply_markup=get_admin_kb(prices)
+    )
+
+
+@dp.callback_query(F.data.startswith("editprice_"))
+async def admin_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало редактирования цены."""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+
+    price_key = callback.data.replace("editprice_", "")
+    current_price = await get_price(price_key)
+    service_name = SERVICE_NAMES.get(price_key, price_key)
+    
+    # Сохраняем ключ для последующего обновления
+    await state.update_data(price_key_to_update=price_key)
+    
+    await callback.message.edit_text(
+        f"Вы выбрали **{service_name}**.\n"
+        f"Текущая цена: **{current_price}** сом.\n\n"
+        "📝 **Введите новую числовую цену** (например, `180`):"
+    )
+    # Переводим в состояние ожидания новой цены
+    await state.set_state(AdminStates.waiting_for_new_price)
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_new_price)
+async def admin_process_new_price(message: Message, state: FSMContext) -> None:
+    """Обработка ввода новой цены и обновление в базе."""
+    user_id = message.from_user.id
+    new_price_str = message.text.replace(',', '.').strip()
+    
+    # Проверка, что введенное значение — это положительное число
+    if not re.match(r'^\d+(\.\d+)?$', new_price_str) or float(new_price_str) < 0:
+        await message.answer("❌ Введите корректное числовое значение цены (не отрицательное).")
+        return
+
+    new_price = float(new_price_str)
+    
+    # Получаем ключ услуги из контекста
+    data = await state.get_data()
+    price_key = data.get('price_key_to_update')
+    service_name = SERVICE_NAMES.get(price_key, price_key)
+
+    # Обновление в базе данных
+    success = await update_price(price_key, new_price)
+
+    if success:
+        await message.answer(f"✅ Цена для **{service_name}** обновлена на **{new_price}** сом.")
+    else:
+        await message.answer("❌ Произошла ошибка при обновлении цены.")
+
+    # Сбрасываем состояние и возвращаемся к панели
+    await state.clear()
+    prices = await get_all_prices()
+    
+    await message.answer(
+        "🛠 **АДМИН-ПАНЕЛЬ: Редактирование цен** 🛠\n"
+        "Выберите следующую услугу для изменения или закройте:",
+        reply_markup=get_admin_kb(prices)
+    )
+
+@dp.callback_query(F.data == "admin_close")
+async def admin_close(callback: CallbackQuery, state: FSMContext) -> None:
+    """Закрытие админ-панели."""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+        
+    await state.clear()
+    await callback.message.edit_text("Панель администрирования закрыта. Бот работает в режиме калькулятора.")
+    await callback.answer()
